@@ -42,6 +42,16 @@ public:
                                 MachineBasicBlock &MBB,
                                 MachineBasicBlock::iterator MI) const override;
 
+  /// Replace a StackProbe stub (if any) with the actual probe code inline
+  void inlineStackProbe(MachineFunction &MF,
+                        MachineBasicBlock &PrologueMBB) const override;
+  MachineBasicBlock::iterator
+  inlineStackProbeFixed(MachineFunction &MF,
+                        MachineBasicBlock::iterator MBBI) const;
+  MachineBasicBlock::iterator
+  inlineStackProbeVar(MachineFunction &MF,
+                      MachineBasicBlock::iterator MBBI) const;
+
   /// Check whether or not the given \p MBB can be used as a epilogue
   /// for the target.
   /// The epilogue will be inserted before the first terminator of that block.
@@ -53,6 +63,10 @@ public:
   bool enableShrinkWrapping(const MachineFunction &MF) const override {
     return false;
   }
+
+  MachineBasicBlock::iterator
+  insertStackProbingLoop(MachineBasicBlock::iterator MBBI,
+                         Register TargetReg) const override;
 
 private:
   /// Check if the frame lowering of \p MF needs a special fixup

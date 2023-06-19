@@ -1311,10 +1311,7 @@ ARMTargetLowering::ARMTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::STACKSAVE,          MVT::Other, Expand);
   setOperationAction(ISD::STACKRESTORE,       MVT::Other, Expand);
 
-  if (Subtarget->isTargetWindows())
-    setOperationAction(ISD::DYNAMIC_STACKALLOC, MVT::i32, Custom);
-  else
-    setOperationAction(ISD::DYNAMIC_STACKALLOC, MVT::i32, Expand);
+  setOperationAction(ISD::DYNAMIC_STACKALLOC, MVT::i32, Custom);
 
   // ARMv6 Thumb1 (except for CPUs that support dmb / dsb) and earlier use
   // the default expansion.
@@ -1729,6 +1726,7 @@ const char *ARMTargetLowering::getTargetNodeName(unsigned Opcode) const {
     MAKE_CASE(ARMISD::TC_RETURN)
     MAKE_CASE(ARMISD::THREAD_POINTER)
     MAKE_CASE(ARMISD::DYN_ALLOC)
+    MAKE_CASE(ARMISD::PROBED_ALLOCA)
     MAKE_CASE(ARMISD::MEMBARRIER_MCR)
     MAKE_CASE(ARMISD::PRELOAD)
     MAKE_CASE(ARMISD::LDRD)
@@ -10585,9 +10583,7 @@ SDValue ARMTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
   case ISD::SDIVREM:
   case ISD::UDIVREM:       return LowerDivRem(Op, DAG);
   case ISD::DYNAMIC_STACKALLOC:
-    if (Subtarget->isTargetWindows())
-      return LowerDYNAMIC_STACKALLOC(Op, DAG);
-    llvm_unreachable("Don't know how to custom lower this!");
+    return LowerDYNAMIC_STACKALLOC(Op, DAG);
   case ISD::STRICT_FP_ROUND:
   case ISD::FP_ROUND: return LowerFP_ROUND(Op, DAG);
   case ISD::STRICT_FP_EXTEND:
@@ -20745,7 +20741,7 @@ SDValue ARMTargetLowering::LowerREM(SDNode *N, SelectionDAG &DAG) const {
 }
 
 SDValue
-ARMTargetLowering::LowerDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG) const {
+ARMTargetLowering::LowerWindowsDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG) const {
   assert(Subtarget->isTargetWindows() && "unsupported target platform");
   SDLoc DL(Op);
 
@@ -22128,4 +22124,83 @@ Value *ARMTargetLowering::createComplexDeinterleavingIR(
   }
 
   return nullptr;
+}
+
+bool ARMTargetLowering::hasInlineStackProbe(const MachineFunction &MF) const {
+  // If the function specifically requests inline stack probes, emit them.
+  if (MF.getFunction().hasFnAttribute("probe-stack")) {
+    if (MF.getFunction().getFnAttribute("probe-stack").getValueAsString() ==
+        "inline-asm")
+      return true;
+    else
+      llvm_unreachable("Unsupported stack probing method");
+  }
+
+  return false;
+}
+
+unsigned ARMTargetLowering::getStackProbeSize(MachineFunction &MF) const {
+  const TargetFrameLowering *TFI = Subtarget->getFrameLowering();
+  unsigned StackAlign = TFI->getStackAlignment();
+  assert(StackAlign >= 1 && isPowerOf2_32(StackAlign) &&
+         "Unexpected stack alignment");
+  // The default stack probe size is 4096 if the function has no
+  // stack-probe-size attribute. This is a safe default because it is the
+  // smallest possible guard page size.
+  unsigned StackProbeSize = 4096;
+  const Function &Fn = MF.getFunction();
+  if (Fn.hasFnAttribute("stack-probe-size"))
+    Fn.getFnAttribute("stack-probe-size")
+        .getValueAsString()
+        .getAsInteger(0, StackProbeSize);
+  // Round down to the stack alignment.
+  StackProbeSize &= ~(StackAlign - 1);
+  return StackProbeSize ? StackProbeSize : StackAlign;
+}
+
+unsigned
+ARMTargetLowering::getStackProbeMaxUnprobedStack(MachineFunction &MF) const {
+  // Since the ABI requires save FP/LR or just LR for leaf functions, it acts as
+  // an implict stack probe. Probing at StackClashCallerGuard means that the
+  // rest of the guard page (assumed to be stack-probe-size attribute) can be
+  // used without further probing.
+  return getStackProbeSize(MF) - ARM::StackClashCallerGuard;
+}
+
+SDValue
+ARMTargetLowering::LowerInlineDYNAMIC_STACKALLOC(SDValue Op,
+                                                 SelectionDAG &DAG) const {
+  SDLoc dl(Op);
+  // Get the inputs.
+  SDNode *Node = Op.getNode();
+  SDValue Chain = Op.getOperand(0);
+  SDValue Size = Op.getOperand(1);
+  MaybeAlign Align =
+      cast<ConstantSDNode>(Op.getOperand(2))->getMaybeAlignValue();
+  EVT VT = Node->getValueType(0);
+
+  // Construct the new SP value in a GPR.
+  SDValue SP = DAG.getCopyFromReg(Chain, dl, ARM::SP, MVT::i32);
+  Chain = SP.getValue(1);
+  SP = DAG.getNode(ISD::SUB, dl, MVT::i32, SP, Size);
+  if (Align)
+    SP = DAG.getNode(ISD::AND, dl, VT, SP.getValue(0),
+                     DAG.getConstant(-(uint64_t)Align->value(), dl, VT));
+
+  // Set the real SP to the new value with a probing loop.
+  Chain = DAG.getNode(ARMISD::PROBED_ALLOCA, dl, MVT::Other, Chain, SP);
+  SDValue Ops[2] = {SP, Chain};
+  return DAG.getMergeValues(Ops, dl);
+}
+
+SDValue ARMTargetLowering::LowerDYNAMIC_STACKALLOC(SDValue Op,
+                                                   SelectionDAG &DAG) const {
+  MachineFunction &MF = DAG.getMachineFunction();
+
+  if (Subtarget->isTargetWindows())
+    return LowerWindowsDYNAMIC_STACKALLOC(Op, DAG);
+  if (hasInlineStackProbe(MF)) {
+    return LowerInlineDYNAMIC_STACKALLOC(Op, DAG);
+  } else
+    return SDValue();
 }

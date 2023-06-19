@@ -2257,8 +2257,12 @@ void CodeGenModule::SetLLVMFunctionAttributesForDefinition(const Decl *D,
   if ((!D || !D->hasAttr<NoUwtableAttr>()) && CodeGenOpts.UnwindTables)
     B.addUWTableAttr(llvm::UWTableKind(CodeGenOpts.UnwindTables));
 
-  if (CodeGenOpts.StackClashProtector)
+  if (CodeGenOpts.StackClashProtector) {
     B.addAttribute("probe-stack", "inline-asm");
+    if (CodeGenOpts.StackProbeSize != 4096)
+      B.addAttribute("stack-probe-size",
+                     llvm::utostr(CodeGenOpts.StackProbeSize));
+  }
 
   if (!hasUnwindExceptions(LangOpts))
     B.addAttribute(llvm::Attribute::NoUnwind);

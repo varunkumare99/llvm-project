@@ -112,6 +112,10 @@ class VectorType;
     SUBE, // Sub using carry
     LSLS, // Shift left producing carry
 
+    // Dynamic stack allocation with stack clash protection, allocation is done
+    // by blocks and each block is probed with a zero store.
+    PROBED_ALLOCA,
+
     VMOVRRD, // double to two gprs.
     VMOVDRR, // Two gprs to double.
     VMOVSR,  // move gpr to single, used for f32 literal constructed in a gpr
@@ -754,6 +758,17 @@ class VectorType;
         ComplexDeinterleavingRotation Rotation, Value *InputA, Value *InputB,
         Value *Accumulator = nullptr) const override;
 
+    /// True if stack clash protection is enabled for this functions.
+    bool hasInlineStackProbe(const MachineFunction &MF) const override;
+
+    /// Get the interval between stack-clash probes, which is equal to the stack
+    /// guard size, in bytes.
+    unsigned getStackProbeSize(MachineFunction &MF) const;
+
+    /// Get the maximum allowed number of unprobed bytes above SP at an ABI
+    /// boundary.
+    unsigned getStackProbeMaxUnprobedStack(MachineFunction &MF) const;
+
   protected:
     std::pair<const TargetRegisterClass *, uint8_t>
     findRepresentativeClass(const TargetRegisterInfo *TRI,
@@ -851,6 +866,8 @@ class VectorType;
                                    SDValue &Chain) const;
     SDValue LowerREM(SDNode *N, SelectionDAG &DAG) const;
     SDValue LowerDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG) const;
+    SDValue LowerWindowsDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG) const;
+    SDValue LowerInlineDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerFP_ROUND(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerFP_EXTEND(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerFP_TO_INT(SDValue Op, SelectionDAG &DAG) const;
@@ -993,7 +1010,12 @@ class VectorType;
 
     FastISel *createFastISel(FunctionLoweringInfo &funcInfo,
                              const TargetLibraryInfo *libInfo);
-
+    // The amount of bytes a caller is allowed update the stack before emit a
+    // probe required by stack clash protection.
+    static constexpr unsigned StackClashCallerGuard = 1024;
+    // How many time to unroll the loop for large outgoing argument during stack
+    // clash protection probing.
+    static constexpr unsigned StackClashCallerMaxUnrollPage = 4;
   } // end namespace ARM
 
 } // end namespace llvm

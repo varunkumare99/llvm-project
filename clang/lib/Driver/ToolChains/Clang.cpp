@@ -3447,11 +3447,18 @@ static void RenderSCPOptions(const ToolChain &TC, const ArgList &Args,
     return;
 
   if (!EffectiveTriple.isX86() && !EffectiveTriple.isSystemZ() &&
-      !EffectiveTriple.isPPC64())
+      !EffectiveTriple.isPPC64() && !EffectiveTriple.isARM() &&
+      !EffectiveTriple.isThumb())
     return;
 
   Args.addOptInFlag(CmdArgs, options::OPT_fstack_clash_protection,
                     options::OPT_fno_stack_clash_protection);
+  if (Args.hasArg(options::OPT_mstack_probe_size)) {
+    StringRef Size = Args.getLastArgValue(options::OPT_mstack_probe_size);
+    CmdArgs.push_back(Args.MakeArgString("-mstack-probe-size=" + Size));
+  } else if (EffectiveTriple.isAArch64()) {
+    CmdArgs.push_back("-mstack-probe-size=65536");
+  }
 }
 
 static void RenderTrivialAutoVarInitOptions(const Driver &D,

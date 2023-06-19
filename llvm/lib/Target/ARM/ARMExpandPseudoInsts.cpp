@@ -2040,6 +2040,15 @@ static void CMSEPopCalleeSaves(const TargetInstrInfo &TII,
   }
 }
 
+static void EmitDynamicProbedAlloc(MachineInstr &MI, MachineBasicBlock *MBB) {
+  Register TargetReg = MI.getOperand(0).getReg();
+  MachineFunction *MF = MBB->getParent();
+  const ARMFrameLowering *TFI =
+      MF->getSubtarget<ARMSubtarget>().getFrameLowering();
+  TFI->insertStackProbingLoop(MI, TargetReg);
+  MI.eraseFromParent();
+}
+
 bool ARMExpandPseudo::ExpandMI(MachineBasicBlock &MBB,
                                MachineBasicBlock::iterator MBBI,
                                MachineBasicBlock::iterator &NextMBBI) {
@@ -2048,7 +2057,11 @@ bool ARMExpandPseudo::ExpandMI(MachineBasicBlock &MBB,
   switch (Opcode) {
     default:
       return false;
-
+    case ARM::PROBED_STACKALLOC_DYN: {
+      EmitDynamicProbedAlloc(MI, &MBB);
+      NextMBBI = MBB.end();
+      return true;
+    }
     case ARM::VBSPd:
     case ARM::VBSPq: {
       Register DstReg = MI.getOperand(0).getReg();
