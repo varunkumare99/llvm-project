@@ -120,6 +120,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
@@ -172,6 +173,8 @@ SpillAlignedNEONRegs("align-neon-spills", cl::Hidden, cl::init(true),
 static MachineBasicBlock::iterator
 skipAlignedDPRCS2Spills(MachineBasicBlock::iterator MI,
                         unsigned NumAlignedDPRCS2Regs);
+
+static unsigned findScratchNonCalleeSaveRegister(MachineBasicBlock *MBB);
 
 ARMFrameLowering::ARMFrameLowering(const ARMSubtarget &sti)
     : TargetFrameLowering(StackGrowsDown, sti.getStackAlignment(), 0, Align(4)),
@@ -739,12 +742,13 @@ void ARMFrameLowering::emitPrologue(MachineFunction &MF,
   const MCRegisterInfo *MRI = Context.getRegisterInfo();
   const ARMBaseRegisterInfo *RegInfo = STI.getRegisterInfo();
   const ARMBaseInstrInfo &TII = *STI.getInstrInfo();
+  const ARMTargetLowering &TLI = *STI.getTargetLowering();
   assert(!AFI->isThumb1OnlyFunction() &&
          "This emitPrologue does not support Thumb1!");
   bool isARM = !AFI->isThumbFunction();
   Align Alignment = STI.getFrameLowering()->getStackAlign();
   unsigned ArgRegsSaveSize = AFI->getArgRegsSaveSize();
-  unsigned NumBytes = MFI.getStackSize();
+  int NumBytes = MFI.getStackSize();
   const std::vector<CalleeSavedInfo> &CSI = MFI.getCalleeSavedInfo();
   int FPCXTSaveSize = 0;
   bool NeedsWinCFI = needsWinCFI(MF);
@@ -1038,11 +1042,21 @@ void ARMFrameLowering::emitPrologue(MachineFunction &MF,
   }
 
   if (NumBytes) {
+    bool NeedsStackProbe = TLI.hasInlineStackProbe(MF) &&
+                           (NumBytes >= TLI.getStackProbeMaxUnprobedStack(MF) ||
+                            MFI.hasVarSizedObjects());
+    bool NeedsRealignment = RegInfo->hasStackRealignment(MF);
     // Adjust SP after all the callee-save spills.
     if (AFI->getNumAlignedDPRCS2Regs() == 0 &&
         tryFoldSPUpdateIntoPushPop(STI, MF, &*LastPush, NumBytes))
       DefCFAOffsetCandidates.addExtraBytes(LastPush, NumBytes);
-    else {
+    else if (NeedsStackProbe && !NeedsRealignment) {
+      Register ScratchReg = findScratchNonCalleeSaveRegister(&MBB);
+      assert(ScratchReg != ARM::NoRegister);
+      BuildMI(MBB, MBBI, dl, TII.get(ARM::PROBED_STACKALLOC))
+          .addDef(ScratchReg)
+          .addImm(-NumBytes);
+    } else {
       emitSPUpdate(isARM, MBB, MBBI, dl, TII, -NumBytes,
                    MachineInstr::FrameSetup);
       DefCFAOffsetCandidates.addInst(std::prev(MBBI), NumBytes);
@@ -1222,8 +1236,19 @@ void ARMFrameLowering::emitPrologue(MachineFunction &MF,
     Align MaxAlign = MFI.getMaxAlign();
     assert(!AFI->isThumb1OnlyFunction());
     if (!AFI->isThumbFunction()) {
-      emitAligningInstructions(MF, AFI, TII, MBB, MBBI, dl, ARM::SP, MaxAlign,
-                               false);
+      bool NeedsStackProbe = TLI.hasInlineStackProbe(MF) &&
+                             (NumBytes + MFI.getMaxAlign().value()) >=
+                                 TLI.getStackProbeMaxUnprobedStack(MF);
+      if (NeedsStackProbe) {
+        Register ScratchReg = findScratchNonCalleeSaveRegister(&MBB);
+        emitAligningInstructions(MF, AFI, TII, MBB, MBBI, dl, ScratchReg,
+                                 MaxAlign, false);
+        BuildMI(MBB, MBBI, dl, TII.get(ARM::PROBED_STACKALLOC_VAR))
+            .addUse(ScratchReg);
+      } else {
+        emitAligningInstructions(MF, AFI, TII, MBB, MBBI, dl, ARM::SP, MaxAlign,
+                                 false);
+      }
     } else {
       // We cannot use sp as source/dest register here, thus we're using r4 to
       // perform the calculations. We're emitting the following sequence:
@@ -1232,14 +1257,29 @@ void ARMFrameLowering::emitPrologue(MachineFunction &MF,
       // -- out lower bits in r4
       // mov sp, r4
       // FIXME: It will be better just to find spare register here.
-      BuildMI(MBB, MBBI, dl, TII.get(ARM::tMOVr), ARM::R4)
-          .addReg(ARM::SP, RegState::Kill)
-          .add(predOps(ARMCC::AL));
-      emitAligningInstructions(MF, AFI, TII, MBB, MBBI, dl, ARM::R4, MaxAlign,
-                               false);
-      BuildMI(MBB, MBBI, dl, TII.get(ARM::tMOVr), ARM::SP)
-          .addReg(ARM::R4, RegState::Kill)
-          .add(predOps(ARMCC::AL));
+      bool NeedsStackProbe = TLI.hasInlineStackProbe(MF) &&
+                             (NumBytes + MFI.getMaxAlign().value()) >=
+                                 TLI.getStackProbeMaxUnprobedStack(MF);
+      if (NeedsStackProbe) {
+        BuildMI(MBB, MBBI, dl, TII.get(ARM::t2MOVr), ARM::R4)
+            .addReg(ARM::SP, RegState::Kill)
+            .add(predOps(ARMCC::AL))
+            .add(condCodeOp());
+
+        emitAligningInstructions(MF, AFI, TII, MBB, MBBI, dl, ARM::R4, MaxAlign,
+                                 false);
+        BuildMI(MBB, MBBI, dl, TII.get(ARM::PROBED_STACKALLOC_VAR))
+            .addUse(ARM::R4);
+      } else {
+        BuildMI(MBB, MBBI, dl, TII.get(ARM::tMOVr), ARM::R4)
+            .addReg(ARM::SP, RegState::Kill)
+            .add(predOps(ARMCC::AL));
+        emitAligningInstructions(MF, AFI, TII, MBB, MBBI, dl, ARM::R4, MaxAlign,
+                                 false);
+        BuildMI(MBB, MBBI, dl, TII.get(ARM::tMOVr), ARM::SP)
+            .addReg(ARM::R4, RegState::Kill)
+            .add(predOps(ARMCC::AL));
+      }
     }
 
     AFI->setShouldRestoreSPFromFP(true);
@@ -3384,4 +3424,380 @@ void ARMFrameLowering::adjustForSegmentedStacks(
 #ifdef EXPENSIVE_CHECKS
   MF.verify();
 #endif
+}
+
+/// Emit a loop to decrement SP until it is equal to TargetReg, with probes at
+///  least every NegProbeSize bytes. Returns an iterator of the first
+///  instruction after the loop. The difference between SP and TargetReg must be
+///  an exact multiple of NegProbeSize.
+
+static MachineBasicBlock::iterator inlineStackProbeLoopExactMultiple(
+    MachineFunction &MF, MachineBasicBlock::iterator MBBI, int64_t NegProbeSize,
+    Register TargetReg, bool NeedsWinCFI, bool *HasWinCFI, bool EmitCFI) {
+  MachineBasicBlock &MBB = *MBBI->getParent();
+  ARMFunctionInfo *AFI = MF.getInfo<ARMFunctionInfo>();
+  bool isARM = !AFI->isThumbFunction();
+  const ARMBaseInstrInfo &TII =
+      *static_cast<const ARMBaseInstrInfo *>(MF.getSubtarget().getInstrInfo());
+  DebugLoc DL = MBB.findDebugLoc(MBBI);
+
+  MachineFunction::iterator MBBInsertPoint = std::next(MBB.getIterator());
+  MachineBasicBlock *LoopMBB = MF.CreateMachineBasicBlock(MBB.getBasicBlock());
+  MF.insert(MBBInsertPoint, LoopMBB);
+  MachineBasicBlock *ExitMBB = MF.CreateMachineBasicBlock(MBB.getBasicBlock());
+  MF.insert(MBBInsertPoint, ExitMBB);
+
+  if (isARM) {
+    // ADD SP, SP, #NegFrameSize (or equivalent if NegFrameSize is not encodable
+    // in ADD).
+    auto loopMBBend = LoopMBB->end();
+    emitSPUpdate(true, *LoopMBB, loopMBBend, DL, TII, NegProbeSize,
+                 MachineInstr::FrameSetup);
+
+    // STR TargetReg, [SP, #StackClashCallerGuard]
+    BuildMI(*LoopMBB, LoopMBB->end(), DL, TII.get(ARM::STRi12))
+        .addReg(TargetReg)
+        .addReg(ARM::SP)
+        .addImm(ARM::StackClashCallerGuard)
+        .addImm(ARMCC::AL)
+        .addImm(0);
+
+    // CMP SP, XZR
+    BuildMI(*LoopMBB, LoopMBB->end(), DL, TII.get(ARM::CMPrr))
+        .addReg(ARM::SP)
+        .addReg(TargetReg)
+        .add(predOps(ARMCC::AL));
+
+    // B.CC Loop
+    BuildMI(*LoopMBB, LoopMBB->end(), DL, TII.get(ARM::Bcc))
+        .addMBB(LoopMBB)
+        .addImm(ARMCC::NE)
+        .addReg(ARM::CPSR);
+  } else {
+    // ADD SP, SP, #NegFrameSize (or equivalent if NegFrameSize is not encodable
+    // in ADD).
+    auto loopMBBend = LoopMBB->end();
+    emitSPUpdate(isARM, *LoopMBB, loopMBBend, DL, TII, NegProbeSize,
+                 MachineInstr::FrameSetup);
+
+    // STR TargetReg, [SP, #StackClashCallerGuard]
+    BuildMI(*LoopMBB, LoopMBB->end(), DL, TII.get(ARM::t2STRi12))
+        .addReg(TargetReg)
+        .addReg(ARM::SP)
+        .addImm(ARM::StackClashCallerGuard)
+        .add(predOps(ARMCC::AL));
+
+    // CMP SP, XZR
+    BuildMI(*LoopMBB, LoopMBB->end(), DL, TII.get(ARM::t2CMPrr))
+        .addReg(ARM::SP)
+        .addReg(TargetReg)
+        .add(predOps(ARMCC::AL));
+
+    // B.CC Loop
+    BuildMI(*LoopMBB, LoopMBB->end(), DL, TII.get(ARM::t2Bcc))
+        .addMBB(LoopMBB)
+        .addImm(ARMCC::NE)
+        .addReg(ARM::CPSR);
+  }
+
+  LoopMBB->addSuccessor(ExitMBB);
+  LoopMBB->addSuccessor(LoopMBB);
+  // Synthesize the exit MBB.
+  ExitMBB->splice(ExitMBB->end(), &MBB, std::next(MBBI), MBB.end());
+  ExitMBB->transferSuccessorsAndUpdatePHIs(&MBB);
+  MBB.addSuccessor(LoopMBB);
+  // Update liveins.
+  recomputeLiveIns(*LoopMBB);
+  recomputeLiveIns(*ExitMBB);
+
+  return ExitMBB->begin();
+}
+
+MachineBasicBlock::iterator ARMFrameLowering::inlineStackProbeFixed(
+    MachineFunction &MF, MachineBasicBlock::iterator MBBI) const {
+  MachineBasicBlock &MBB = *MBBI->getParent();
+  const ARMTargetLowering *TLI =
+      MF.getSubtarget<ARMSubtarget>().getTargetLowering();
+  const ARMBaseInstrInfo &TII =
+      *static_cast<const ARMBaseInstrInfo *>(MF.getSubtarget().getInstrInfo());
+
+  ARMFunctionInfo *AFI = MF.getInfo<ARMFunctionInfo>();
+  bool isARM = !AFI->isThumbFunction();
+  bool HasFP = hasFP(MF);
+  bool NeedsWinCFI = needsWinCFI(MF);
+  bool EmitCFI = !NeedsWinCFI;
+  bool HasWinCFI = false;
+
+  DebugLoc DL = MBB.findDebugLoc(MBBI);
+  Register ScratchReg = MBBI->getOperand(0).getReg();
+  int64_t NegFrameSize = MBBI->getOperand(1).getImm();
+  int64_t NegProbeSize = -(int64_t)TLI->getStackProbeSize(MF);
+  int64_t NumBlocks = NegFrameSize / NegProbeSize;
+  int64_t NegResidualSize = NegFrameSize % NegProbeSize;
+  bool NeedResidualProbe =
+      NegResidualSize <= -(int64_t)TLI->getStackProbeMaxUnprobedStack(MF);
+  bool UnrollProbeLoop = NumBlocks <= ARM::StackClashCallerMaxUnrollPage;
+  LLVM_DEBUG(dbgs() << "Stack probing (fixed): total " << NegFrameSize
+                    << " bytes, " << NumBlocks << " blocks of " << NegProbeSize
+                    << " bytes, " << NeedResidualProbe << " block of "
+                    << NegResidualSize << " bytes"
+                    << " (residual), Unroll: " << UnrollProbeLoop << ", "
+                    << "CFI: " << (EmitCFI && !HasFP) << "\n");
+
+  MachineBasicBlock::iterator NextInst;
+  if (UnrollProbeLoop) {
+    for (int i = 0; i < NumBlocks; ++i) {
+      if (isARM) {
+        // ADD SP, SP, #NegFrameSize (or equivalent if NegFrameSize is not
+        // encodable in ADD).
+        emitSPUpdate(isARM, MBB, MBBI, DL, TII, NegProbeSize,
+                     MachineInstr::NoFlags);
+        // STR ScratchReg, [SP, #StackClashCallerGuard]
+        BuildMI(MBB, MBBI, DL, TII.get(ARM::STRi12))
+            .addReg(ScratchReg)
+            .addReg(ARM::SP)
+            .addImm(ARM::StackClashCallerGuard)
+            .addImm(ARMCC::AL)
+            .addImm(0);
+      } else {
+
+        emitSPUpdate(isARM, MBB, MBBI, DL, TII, NegProbeSize,
+                     MachineInstr::FrameSetup);
+
+        // STR ScratchReg, [SP, #StackClashCallerGuard]
+        BuildMI(MBB, MBBI, DL, TII.get(ARM::t2STRi12))
+            .addReg(ScratchReg)
+            .addReg(ARM::SP)
+            .addImm(ARM::StackClashCallerGuard)
+            .add(predOps(ARMCC::AL));
+      }
+    }
+    NextInst = std::next(MBBI);
+  } else if (NumBlocks != 0) {
+    // ADD ScratchReg, SP, #NegFrameSize (or equivalent if NegFrameSize is not
+    // encodable in ADD).
+    // TODO:
+    emitRegPlusImmediate(isARM, MBB, MBBI, DL, TII, ScratchReg, ARM::SP,
+                         NegFrameSize, MachineInstr::NoFlags, ARMCC::AL, 0);
+
+    NextInst = inlineStackProbeLoopExactMultiple(
+        MF, MBBI, NegProbeSize, ScratchReg, NeedsWinCFI, &HasWinCFI, EmitCFI);
+  }
+
+  if (NegResidualSize != 0) {
+    // ADD SP, SP, #NegFrameSize (or equivalent if NegFrameSize is not encodable
+    // in ADD).
+    if (isARM) {
+      emitSPUpdate(isARM, MBB, MBBI, DL, TII, NegResidualSize,
+                   MachineInstr::FrameSetup);
+      if (NeedResidualProbe) {
+        // STR ScratchReg, [SP, #StackClashCallerGuard]
+        BuildMI(MBB, MBBI, DL, TII.get(ARM::STRi12))
+            .addReg(ScratchReg)
+            .addReg(ARM::SP)
+            .addImm(ARM::StackClashCallerGuard)
+            .addImm(ARMCC::AL)
+            .addImm(0);
+      }
+    } else {
+      emitSPUpdate(isARM, MBB, MBBI, DL, TII, NegResidualSize,
+                   MachineInstr::FrameSetup);
+      if (NeedResidualProbe) {
+        // STR ScratchReg, [SP, #StackClashCallerGuard]
+        BuildMI(MBB, MBBI, DL, TII.get(ARM::t2STRi12))
+            .addReg(ScratchReg)
+            .addReg(ARM::SP)
+            .addImm(ARM::StackClashCallerGuard)
+            .add(predOps(ARMCC::AL));
+      }
+    }
+  }
+
+  MBBI->eraseFromParent();
+  return NextInst;
+}
+
+MachineBasicBlock::iterator
+ARMFrameLowering::inlineStackProbeVar(MachineFunction &MF,
+                                      MachineBasicBlock::iterator MBBI) const {
+  MachineBasicBlock &MBB = *MBBI->getParent();
+
+  DebugLoc DL = MBB.findDebugLoc(MBBI);
+  Register TargetReg = MBBI->getOperand(0).getReg();
+  MachineBasicBlock::iterator NextInst = std::next(MBBI);
+
+  NextInst = insertStackProbingLoop(MBBI, TargetReg);
+
+  MBBI->eraseFromParent();
+  return NextInst;
+}
+
+MachineBasicBlock::iterator
+ARMFrameLowering::insertStackProbingLoop(MachineBasicBlock::iterator MBBI,
+                                         Register TargetReg) const {
+  MachineBasicBlock &MBB = *MBBI->getParent();
+  MachineFunction &MF = *MBB.getParent();
+  ARMFunctionInfo *AFI = MF.getInfo<ARMFunctionInfo>();
+  bool isARM = !AFI->isThumbFunction();
+  const ARMTargetLowering *TLI =
+      MF.getSubtarget<ARMSubtarget>().getTargetLowering();
+  const ARMBaseInstrInfo &TII =
+      *static_cast<const ARMBaseInstrInfo *>(MF.getSubtarget().getInstrInfo());
+
+  int64_t NegProbeSize = -(int64_t)TLI->getStackProbeSize(MF);
+  DebugLoc DL = MBB.findDebugLoc(MBBI);
+
+  MachineFunction::iterator MBBInsertPoint = std::next(MBB.getIterator());
+  MachineBasicBlock *LoopTestMBB =
+      MF.CreateMachineBasicBlock(MBB.getBasicBlock());
+  MF.insert(MBBInsertPoint, LoopTestMBB);
+  MachineBasicBlock *LoopBodyMBB =
+      MF.CreateMachineBasicBlock(MBB.getBasicBlock());
+  MF.insert(MBBInsertPoint, LoopBodyMBB);
+  MachineBasicBlock *ExitMBB = MF.CreateMachineBasicBlock(MBB.getBasicBlock());
+  MF.insert(MBBInsertPoint, ExitMBB);
+
+  // LoopTest:
+  //   SUB SP, SP, #ProbeSize
+  if (isARM) {
+    MachineBasicBlock::iterator LoopTestMBBItr = LoopTestMBB->end();
+    emitSPUpdate(isARM, *LoopTestMBB, LoopTestMBBItr, DL, TII, NegProbeSize,
+                 MachineInstr::NoFlags);
+
+    //   CMP SP, TargetReg
+    BuildMI(*LoopTestMBB, LoopTestMBB->end(), DL, TII.get(ARM::CMPrr))
+        .addReg(ARM::SP)
+        .addReg(TargetReg)
+        .add(predOps(ARMCC::AL));
+
+    //   B.LE LoopExit
+    BuildMI(*LoopTestMBB, LoopTestMBB->end(), DL, TII.get(ARM::Bcc))
+        .addMBB(ExitMBB)
+        .addImm(ARMCC::LE)
+        .addReg(ARM::CPSR);
+
+    //   STR TargetReg, [SP, #StackClashCallerGuard]
+    BuildMI(*LoopBodyMBB, LoopBodyMBB->end(), DL, TII.get(ARM::STRi12))
+        .addReg(TargetReg)
+        .addReg(ARM::SP)
+        .addImm(ARM::StackClashCallerGuard)
+        .addImm(ARMCC::AL)
+        .addImm(0);
+
+    //   B loop
+    BuildMI(*LoopBodyMBB, LoopBodyMBB->end(), DL, TII.get(ARM::B))
+        .addMBB(LoopTestMBB);
+
+    // LoopExit:
+    //   MOV SP, TargetReg
+    BuildMI(*ExitMBB, ExitMBB->end(), DL, TII.get(ARM::MOVr), ARM::SP)
+        .addReg(TargetReg)
+        .add(predOps(ARMCC::AL))
+        .add(condCodeOp());
+
+    //   STR TargetReg, [SP, #StackClashCallerGuard]
+    BuildMI(*ExitMBB, ExitMBB->end(), DL, TII.get(ARM::STRi12))
+        .addReg(TargetReg)
+        .addReg(ARM::SP)
+        .addImm(ARM::StackClashCallerGuard)
+        .addImm(ARMCC::AL)
+        .addImm(0);
+  } else {
+    MachineBasicBlock::iterator LoopTestMBBItr = LoopTestMBB->end();
+    emitSPUpdate(isARM, *LoopTestMBB, LoopTestMBBItr, DL, TII, NegProbeSize,
+                 MachineInstr::FrameSetup);
+
+    //   CMP SP, TargetReg
+    BuildMI(*LoopTestMBB, LoopTestMBB->end(), DL, TII.get(ARM::t2CMPrr))
+        .addReg(ARM::SP)
+        .addReg(TargetReg)
+        .add(predOps(ARMCC::AL));
+
+    //   B.LE LoopExit
+    BuildMI(*LoopTestMBB, LoopTestMBB->end(), DL, TII.get(ARM::t2Bcc))
+        .addMBB(ExitMBB)
+        .addImm(ARMCC::LE)
+        .addReg(ARM::CPSR);
+
+    //   STR TargetReg, [SP, #StackClashCallerGuard]
+    BuildMI(*LoopBodyMBB, LoopBodyMBB->end(), DL, TII.get(ARM::t2STRi12))
+        .addReg(TargetReg)
+        .addReg(ARM::SP)
+        .addImm(ARM::StackClashCallerGuard)
+        .add(predOps(ARMCC::AL));
+
+    //   B loop
+    BuildMI(*LoopBodyMBB, LoopBodyMBB->end(), DL, TII.get(ARM::t2B))
+        .addMBB(LoopTestMBB)
+        .add(predOps(ARMCC::AL));
+
+    // LoopExit:
+    //   MOV SP, TargetReg
+    BuildMI(*ExitMBB, ExitMBB->end(), DL, TII.get(ARM::t2MOVr), ARM::SP)
+        .addReg(TargetReg)
+        .add(predOps(ARMCC::AL))
+        .add(condCodeOp());
+
+    //   STR TargetReg, [SP, #StackClashCallerGuard]
+    BuildMI(*ExitMBB, ExitMBB->end(), DL, TII.get(ARM::t2STRi12))
+        .addReg(TargetReg)
+        .addReg(ARM::SP)
+        .addImm(ARM::StackClashCallerGuard)
+        .add(predOps(ARMCC::AL));
+  }
+
+  LoopTestMBB->addSuccessor(ExitMBB);
+  LoopTestMBB->addSuccessor(LoopBodyMBB);
+  LoopBodyMBB->addSuccessor(LoopTestMBB);
+
+  // Synthesize the exit MBB.
+  ExitMBB->splice(ExitMBB->end(), &MBB, std::next(MBBI), MBB.end());
+  ExitMBB->transferSuccessorsAndUpdatePHIs(&MBB);
+  MBB.addSuccessor(LoopTestMBB);
+
+  // Update liveins.
+  if (MF.getRegInfo().reservedRegsFrozen()) {
+    recomputeLiveIns(*LoopTestMBB);
+    recomputeLiveIns(*LoopBodyMBB);
+    recomputeLiveIns(*ExitMBB);
+  }
+
+  return ExitMBB->begin();
+}
+
+void ARMFrameLowering::inlineStackProbe(MachineFunction &MF,
+                                        MachineBasicBlock &MBB) const {
+  for (auto MBBI = MBB.begin(), E = MBB.end(); MBBI != E;) {
+    if (MBBI->getOpcode() == ARM::PROBED_STACKALLOC) {
+      MBBI = inlineStackProbeFixed(MF, MBBI);
+      E = MBBI->getParent()->end();
+    } else if (MBBI->getOpcode() == ARM::PROBED_STACKALLOC_VAR) {
+      MBBI = inlineStackProbeVar(MF, MBBI);
+      E = MBBI->getParent()->end();
+    } else {
+      ++MBBI;
+    }
+  }
+}
+
+static unsigned findScratchNonCalleeSaveRegister(MachineBasicBlock *MBB) {
+  MachineFunction *MF = MBB->getParent();
+
+  const ARMSubtarget &Subtarget = MF->getSubtarget<ARMSubtarget>();
+  const ARMBaseRegisterInfo TRI = *Subtarget.getRegisterInfo();
+  LivePhysRegs LiveRegs(TRI);
+  LiveRegs.addLiveIns(*MBB);
+
+  // Mark callee saved registers as used so we will not choose them.
+  const MCPhysReg *CSRegs = MF->getRegInfo().getCalleeSavedRegs();
+  for (unsigned i = 0; CSRegs[i]; ++i)
+    LiveRegs.addReg(CSRegs[i]);
+
+  const MachineRegisterInfo &MRI = MF->getRegInfo();
+  const TargetRegisterClass &RC = ARM::GPRRegClass;
+  for (unsigned Reg : RC) {
+    if (LiveRegs.available(MRI, Reg))
+      return Reg;
+  }
+  return ARM::NoRegister;
 }

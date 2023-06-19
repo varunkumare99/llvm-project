@@ -2169,6 +2169,10 @@ PseudoInst<(outs), (ins cpinst_operand:$instid, cpinst_operand:$cpidx,
                         i32imm:$size), NoItinerary, []>;
 
 
+def ARMprobedalloca
+    : SDNode<"ARMISD::PROBED_ALLOCA",
+             SDTypeProfile<0, 1, [SDTCisPtrTy<0>]>,
+             [SDNPHasChain]>;
 // FIXME: Marking these as hasSideEffects is necessary to prevent machine DCE
 // from removing one half of the matched pairs. That breaks PEI, which assumes
 // these will always be in pairs, and asserts if it finds otherwise. Better way?
@@ -2180,6 +2184,33 @@ PseudoInst<(outs), (ins i32imm:$amt1, i32imm:$amt2, pred:$p), NoItinerary,
 def ADJCALLSTACKDOWN :
 PseudoInst<(outs), (ins i32imm:$amt, i32imm:$amt2, pred:$p), NoItinerary,
            [(ARMcallseq_start timm:$amt, timm:$amt2)]>;
+
+// Probed stack allocation of a constant size, used in function prologues when
+// stack-clash protection is enabled.
+def PROBED_STACKALLOC : PseudoInst<(outs GPR:$scratch),
+                               (ins i32imm:$stacksize),
+                               NoItinerary,
+                               []>,
+                               Sched<[]>;
+
+// Probed stack allocation of a variable size, used in function prologues when
+// stack-clash protection is enabled. The register input is the target SP,
+// which should be below the current value, and has no alignment requirements
+// beyond the usual 16-byte alignment for SP.
+def PROBED_STACKALLOC_VAR : PseudoInst<(outs),
+                                   (ins GPR:$target),
+                                   NoItinerary,
+                                   []>,
+                                   Sched<[]>;
+
+// Probed stack allocations of a variable size, used for allocas of unknown size
+// when stack-clash protection is enabled.
+def PROBED_STACKALLOC_DYN
+    : PseudoInst<(outs),
+             (ins GPR:$target),
+             NoItinerary,
+             [(ARMprobedalloca GPR:$target)]>,
+      Sched<[]>;
 }
 
 def HINT : AI<(outs), (ins imm0_239:$imm), MiscFrm, NoItinerary,

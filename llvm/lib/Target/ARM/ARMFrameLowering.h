@@ -79,6 +79,10 @@ public:
   const SpillSlot *
   getCalleeSavedSpillSlots(unsigned &NumEntries) const override;
 
+  virtual MachineBasicBlock::iterator
+  insertStackProbingLoop(MachineBasicBlock::iterator MBBI,
+                         Register TargetReg) const ;
+
 private:
   void emitPushInst(MachineBasicBlock &MBB, MachineBasicBlock::iterator MI,
                     ArrayRef<CalleeSavedInfo> CSI, unsigned StmOpc,
@@ -94,6 +98,15 @@ private:
   eliminateCallFramePseudoInstr(MachineFunction &MF,
                                 MachineBasicBlock &MBB,
                                 MachineBasicBlock::iterator MI) const override;
+  /// Replace a StackProbe stub (if any) with the actual probe code inline
+  void inlineStackProbe(MachineFunction &MF,
+                        MachineBasicBlock &PrologueMBB) const override;
+  MachineBasicBlock::iterator
+  inlineStackProbeFixed(MachineFunction &MF,
+                        MachineBasicBlock::iterator MBBI) const;
+  MachineBasicBlock::iterator
+  inlineStackProbeVar(MachineFunction &MF,
+                      MachineBasicBlock::iterator MBBI) const;
 };
 
 } // end namespace llvm
